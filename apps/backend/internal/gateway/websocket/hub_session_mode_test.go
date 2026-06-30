@@ -37,6 +37,7 @@ func newTestClient(id string) *Client {
 		userSubscriptions:    map[string]bool{},
 		runSubscriptions:     map[string]bool{},
 		logger:               log,
+		sentLog:              newWsSentLog(),
 	}
 }
 
@@ -219,6 +220,28 @@ func TestHub_UnsubscribeFromOnlySubscriberFiresPaused(t *testing.T) {
 	}
 	if got[1].mode != SessionModePaused {
 		t.Errorf("second event mode = %v, want paused", got[1].mode)
+	}
+}
+
+func TestHub_PausedSessionDropsSessionSequence(t *testing.T) {
+	h := newTestHub(t)
+	rec := newModeRecorder()
+	h.AddSessionModeListener(rec.listener())
+
+	c := newTestClient("c1")
+	h.SubscribeToSession(c, "sess-1")
+	rec.waitForCount(1, time.Second)
+	if got := h.nextSessionSeq("sess-1"); got != 1 {
+		t.Fatalf("session seq = %d; want 1", got)
+	}
+
+	h.UnsubscribeFromSession(c, "sess-1")
+	got := rec.waitForCount(2, time.Second)
+	if len(got) < 2 || got[1].mode != SessionModePaused {
+		t.Fatalf("expected paused event after unsubscribe, got %+v", got)
+	}
+	if got := currentSessionSeq(h, "sess-1"); got != 0 {
+		t.Fatalf("session seq after paused transition = %d; want deleted", got)
 	}
 }
 

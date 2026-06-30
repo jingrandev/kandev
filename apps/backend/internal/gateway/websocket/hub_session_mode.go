@@ -252,6 +252,7 @@ func (h *Hub) fireDebouncedDownTransition(sessionID string) {
 		// Session is fully idle — drop the entry so the maps don't grow
 		// unbounded over a long-running gateway. Next event re-adds.
 		delete(h.sessionMode.lastMode, sessionID)
+		h.clearSessionSeq(sessionID)
 	} else {
 		h.sessionMode.lastMode[sessionID] = latest
 	}

@@ -16,14 +16,22 @@ const (
 	MessageTypeError        MessageType = "error"
 )
 
-// Message is the base envelope for all WebSocket messages
+// Message is the base envelope for all WebSocket messages.
+//
+// ConnectionID, ConnectionSeq, SessionID, and SessionSeq are stamped by the
+// gateway at write time. They are additive accounting fields used by E2E tests
+// to detect dropped or misrouted WebSocket events.
 type Message struct {
-	ID        string            `json:"id,omitempty"`
-	Type      MessageType       `json:"type"`
-	Action    string            `json:"action"`
-	Payload   json.RawMessage   `json:"payload"`
-	Timestamp time.Time         `json:"timestamp"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
+	ID            string            `json:"id,omitempty"`
+	Type          MessageType       `json:"type"`
+	Action        string            `json:"action"`
+	Payload       json.RawMessage   `json:"payload"`
+	Timestamp     time.Time         `json:"timestamp"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
+	ConnectionID  string            `json:"connection_id,omitempty"`
+	ConnectionSeq int64             `json:"connection_seq,omitempty"`
+	SessionID     string            `json:"session_id,omitempty"`
+	SessionSeq    int64             `json:"session_seq,omitempty"`
 }
 
 // EnsureMetadata lazily initializes and returns the Metadata map.

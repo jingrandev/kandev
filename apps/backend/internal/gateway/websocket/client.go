@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -43,6 +44,8 @@ type Client struct {
 	mu                      sync.RWMutex
 	closed                  bool
 	logger                  *logger.Logger
+	connectionSeq           atomic.Int64
+	sentLog                 *wsSentLog
 }
 
 // NewClient creates a new WebSocket client
@@ -58,6 +61,7 @@ func NewClient(id string, conn *websocket.Conn, hub *Hub, log *logger.Logger) *C
 		userSubscriptions:    make(map[string]bool),
 		runSubscriptions:     make(map[string]bool),
 		logger:               log.WithFields(zap.String("client_id", id)),
+		sentLog:              newWsSentLog(),
 	}
 }
 
@@ -309,7 +313,8 @@ func (c *Client) sendSessionData(sessionID string) {
 		zap.String("session_id", sessionID),
 		zap.Int("count", len(data)))
 
-	// Send each piece of session data as a notification
+	// Replay data is delivered only to this connection; live session broadcasts
+	// carry session_seq so multi-client subscribers share one logical sequence.
 	for _, msg := range data {
 		c.sendMessage(msg)
 	}
@@ -473,30 +478,120 @@ func (c *Client) handleSessionUnfocus(msg *ws.Message) {
 	c.sendMessage(resp)
 }
 
-// sendMessage sends a message to the client
-func (c *Client) sendMessage(msg *ws.Message) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		c.logger.Error("Failed to marshal message", zap.Error(err))
-		return
-	}
-	c.sendBytes(data)
+// sendMessage stamps and sends a connection-wide message to the client.
+func (c *Client) sendMessage(msg *ws.Message) bool {
+	return c.sendMessageForSession("", msg)
 }
 
-func (c *Client) sendBytes(data []byte) bool {
+func (c *Client) sendMessageForSession(sessionID string, msg *ws.Message) bool {
+	return c.sendMessageForSessionSeq(sessionID, 0, msg)
+}
+
+func (c *Client) sendMessageForSessionSeq(sessionID string, sessionSeq int64, msg *ws.Message) bool {
+	stamped, ok := c.stampForSession(sessionID, sessionSeq, msg)
+	if !ok {
+		return false
+	}
+	if !c.sendStampedMessage(&stamped) {
+		return false
+	}
+	if c.sentLog != nil {
+		c.sentLog.Append(
+			stamped.connectionSeq,
+			stamped.sessionSeq,
+			stamped.sessionID,
+			stamped.msgType,
+			stamped.action,
+			stamped.sentAt,
+		)
+	}
+	return true
+}
+
+func (c *Client) sendStampedCopyForSessionSeq(sessionID string, sessionSeq int64, msg *ws.Message) bool {
+	if msg == nil {
+		return false
+	}
+	clone := *msg
+	return c.sendMessageForSessionSeq(sessionID, sessionSeq, &clone)
+}
+
+type stampedMessage struct {
+	message       ws.Message
+	connectionSeq int64
+	sessionSeq    int64
+	sessionID     string
+	msgType       string
+	action        string
+	sentAt        time.Time
+}
+
+func (c *Client) stampForSession(
+	sessionID string,
+	sessionSeq int64,
+	msg *ws.Message,
+) (stampedMessage, bool) {
+	if msg == nil {
+		return stampedMessage{}, false
+	}
+	stampedMsg := *msg
+	stampedMsg.ConnectionID = c.ID
+	stampedMsg.ConnectionSeq = 0
+	stampedMsg.SessionID = ""
+	stampedMsg.SessionSeq = 0
+	if sessionID != "" {
+		stampedMsg.SessionID = sessionID
+		stampedMsg.SessionSeq = sessionSeq
+	}
+	return stampedMessage{
+		message:    stampedMsg,
+		sessionSeq: stampedMsg.SessionSeq,
+		sessionID:  sessionID,
+		msgType:    string(stampedMsg.Type),
+		action:     stampedMsg.Action,
+	}, true
+}
+
+func (c *Client) canAcceptStampedMessage() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.closed && len(c.send) < cap(c.send)
+}
+
+func (c *Client) sendStampedMessage(stamped *stampedMessage) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return false
 	}
-
-	select {
-	case c.send <- data:
-		return true
-	default:
+	if len(c.send) >= cap(c.send) {
 		c.logger.Warn("Client send buffer full")
 		return false
 	}
+
+	connectionSeq := c.connectionSeq.Load() + 1
+	message := stamped.message
+	message.ConnectionSeq = connectionSeq
+	if stamped.sessionID != "" && stamped.sessionSeq <= 0 && c.hub != nil {
+		if message.Payload != nil && !json.Valid(message.Payload) {
+			c.logger.Error("Failed to marshal message", zap.String("error", "invalid JSON payload"))
+			return false
+		}
+		stamped.sessionSeq = c.hub.nextSessionSeq(stamped.sessionID)
+		message.SessionSeq = stamped.sessionSeq
+		stamped.message.SessionSeq = stamped.sessionSeq
+	}
+	data, err := json.Marshal(&message)
+	if err != nil {
+		c.logger.Error("Failed to marshal message", zap.Error(err))
+		return false
+	}
+
+	c.connectionSeq.Store(connectionSeq)
+	c.send <- data
+	stamped.connectionSeq = connectionSeq
+	stamped.sentAt = time.Now().UTC()
+	return true
 }
 
 // sendError sends an error message to the client

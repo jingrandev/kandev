@@ -514,6 +514,9 @@ func (sm *SessionManager) waitForPromptDone(ctx context.Context, execution *Agen
 				sm.logger.Error("prompt completed with error",
 					zap.String("execution_id", execution.ID),
 					zap.String("error", signal.Error))
+				if isAgentReportedSessionLoadMissingErr(signal.Error) {
+					return nil, fmt.Errorf("%w: %s: %w", ErrAgentReported, signal.Error, ErrExecutionNotFound)
+				}
 				// Wrap the cancel-escalation sentinel so PromptTask can identify it and
 				// skip the REVIEW task-state transition — the user is cancelling, not
 				// hitting a real agent failure.
@@ -760,6 +763,28 @@ func isSessionUnknownErr(err error) bool {
 	// Some agents return the error in the wrapped message string instead of a
 	// structured RequestError. Match the canonical phrase as a safety net.
 	return strings.Contains(err.Error(), "Resource not found")
+}
+
+// PromptCompletionSignal currently crosses the agentctl updates stream as JSON
+// with only the rendered error string. Keep this fallback narrow until the
+// stream carries structured ACP error codes alongside the message.
+func isAgentReportedSessionLoadMissingErr(message string) bool {
+	lower := strings.ToLower(message)
+	hasMissingSessionSignal := strings.Contains(lower, "session not found") ||
+		strings.Contains(lower, "no such session") ||
+		strings.Contains(lower, "resource not found") ||
+		strings.Contains(lower, "could not find session") ||
+		strings.Contains(lower, "session id not recognized") ||
+		strings.Contains(lower, "unknown session") ||
+		strings.Contains(lower, "session does not exist") ||
+		(strings.Contains(lower, "session") && strings.Contains(lower, "not found"))
+	if !hasMissingSessionSignal {
+		return false
+	}
+	return strings.Contains(lower, "failed to load session") ||
+		strings.Contains(lower, "session/load") ||
+		strings.Contains(lower, "load session") ||
+		strings.Contains(lower, "loading")
 }
 
 func isAgentStreamNotConnectedErr(err error) bool {
